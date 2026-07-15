@@ -28,6 +28,7 @@
 
 #include "rest/json.hpp"
 #include "types.hpp"
+#include <cstdint>
 #include <map>
 #include <set>
 #include <sstream>
@@ -143,7 +144,7 @@ static cJSON *MeshChildrenIp62Json(const std::vector<DeviceIp6Addrs> &aChildrenI
 
 static cJSON *Bytes2HexJson(const uint8_t *aBytes, uint8_t aLength)
 {
-    char hex[2 * aLength + 1];
+    char hex[2 * UINT8_MAX + 1];
 
     otbr::Utils::Bytes2Hex(aBytes, aLength, hex);
     hex[2 * aLength] = '\0';
