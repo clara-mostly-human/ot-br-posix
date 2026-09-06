@@ -52,6 +52,16 @@
 #include "utils/dns_utils.hpp"
 #include "utils/string_utils.hpp"
 
+// kDNSServiceErr_StaleData entered dns_sd.h with mDNSResponder 2559 (the
+// macOS 15 SDK); older Apple SDKs predate it, and Apple's header stamps its
+// build into _DNS_SD_H. The mDNSResponder builds used on other platforms are
+// recent enough to have it.
+#if defined(__APPLE__) && defined(_DNS_SD_H) && ((_DNS_SD_H + 0) < 2559000000LL)
+#define OTBR_MDNSSD_HAVE_STALE_DATA 0
+#else
+#define OTBR_MDNSSD_HAVE_STALE_DATA 1
+#endif
+
 namespace otbr {
 
 namespace Mdns {
@@ -214,8 +224,10 @@ static const char *DNSErrorToString(DNSServiceErrorType aError)
     case kDNSServiceErr_DefunctConnection:
         return "Defunct Connection";
 
+#if OTBR_MDNSSD_HAVE_STALE_DATA
     case kDNSServiceErr_StaleData:
         return "Stale Data";
+#endif
 
     default:
         return "Unhandled Error";
@@ -237,7 +249,9 @@ bool IsRetryableError(DNSServiceErrorType aError)
     case kDNSServiceErr_DoubleNAT:
     case kDNSServiceErr_Timeout:
     case kDNSServiceErr_DefunctConnection:
+#if OTBR_MDNSSD_HAVE_STALE_DATA
     case kDNSServiceErr_StaleData:
+#endif
     case kDNSServiceErr_BadTime:
     case kDNSServiceErr_Firewall:
     case kDNSServiceErr_NATPortMappingUnsupported:
