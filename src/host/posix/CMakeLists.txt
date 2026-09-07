@@ -45,6 +45,15 @@ add_library(otbr-posix
     udp_proxy.hpp
 )
 
+if(OTBR_USERSPACE_MCAST_FWD)
+    target_sources(otbr-posix PRIVATE
+        bpf_tap.hpp
+        bpf_tap.cpp
+        mcast_forwarder.hpp
+        mcast_forwarder.cpp
+    )
+endif()
+
 target_link_libraries(otbr-posix
     otbr-common
     otbr-utils
