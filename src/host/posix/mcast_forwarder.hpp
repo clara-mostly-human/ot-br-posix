@@ -129,6 +129,11 @@ public:
     const Counters &GetThreadToBackboneCounters(void) const { return mThreadToBackbone; }
     const Counters &GetBackboneToThreadCounters(void) const { return mBackboneToThread; }
 
+    const std::string                     &GetThreadIfName(void) const { return mThreadIfName; }
+    const std::string                     &GetBackboneIfName(void) const { return mBackboneIfName; }
+    const std::set<Ip6Address>            &GetThreadListeners(void) const { return mThreadListeners; }
+    const std::map<Ip6Address, Timepoint> &GetBackboneListeners(void) const { return mBackboneListeners; }
+
     /**
      * Extracts the group membership changes an MLD message carries.
      *
