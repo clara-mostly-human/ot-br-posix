@@ -62,13 +62,17 @@ namespace otbr {
  * it. It tracks the groups that have listeners on each side — the Thread
  * side from the core's Multicast Listener Registration table, the backbone
  * side by snooping MLD reports on the backbone interface — and moves
- * packets between the Thread interface and the backbone through BPF taps.
+ * packets between the Thread interface and the backbone through BPF taps,
+ * applying the same rules as the Linux path:
  *
- * Thread -> backbone: every multicast packet the Thread stack hands to the
- * host with a scope beyond realm-local is a candidate (the same rule the
- * Linux path applies); it is forwarded once (duplicate suppression), within
- * per-group and overall rate limits, with its hop limit decremented.
- * Backbone -> Thread is not implemented yet.
+ * - Thread -> backbone: every multicast packet the Thread stack hands to
+ *   the host with a scope beyond realm-local is forwarded, whether or not
+ *   a backbone listener is known.
+ * - Backbone -> Thread: only packets to groups with a registered Thread
+ *   listener are injected into the mesh, where they are flooded (MPL).
+ *
+ * Both directions forward each packet once (duplicate suppression), within
+ * per-group and overall rate limits, with the hop limit decremented.
  */
 class McastForwarder : public MainloopProcessor, private NonCopyable
 {
@@ -90,6 +94,7 @@ public:
         uint64_t mReceived    = 0; ///< Packets taken from the tap.
         uint64_t mForwarded   = 0; ///< Packets written to the other side.
         uint64_t mRejected    = 0; ///< Not forwardable (policy).
+        uint64_t mNoListener  = 0; ///< No listener for the group on the other side.
         uint64_t mDuplicates  = 0; ///< Copies of a packet already forwarded.
         uint64_t mRateLimited = 0; ///< Dropped by the rate limiter.
         uint64_t mErrors      = 0; ///< Write failures.
@@ -122,6 +127,7 @@ public:
     bool HasBackboneListener(const Ip6Address &aGroup) const { return mBackboneListeners.count(aGroup) != 0; }
 
     const Counters &GetThreadToBackboneCounters(void) const { return mThreadToBackbone; }
+    const Counters &GetBackboneToThreadCounters(void) const { return mBackboneToThread; }
 
     /**
      * Extracts the group membership changes an MLD message carries.
@@ -153,6 +159,14 @@ public:
     void HandleThreadPacket(const uint8_t *aPacket, size_t aLength, Timepoint aNow);
 
     /**
+     * Runs one IPv6 packet from the backbone through the forwarding pipeline
+     * (policy, Thread listener check, duplicate suppression, rate limit)
+     * and, if it passes, injects it into the Thread network. Public for the
+     * same reason as HandleThreadPacket().
+     */
+    void HandleBackbonePacket(const uint8_t *aPacket, size_t aLength, Timepoint aNow);
+
+    /**
      * Indicates whether a group is one the forwarder tracks: multicast with a
      * scope beyond link-local, the only scopes a Backbone Router carries.
      */
@@ -173,27 +187,34 @@ private:
 
     void Enable(void);
     void Disable(void);
-    void OpenBackboneTap(void);
+    void OpenBackboneMldTap(void);
+    void OpenBackboneDataTap(void);
     void OpenThreadTap(void);
     void HandleMldFrame(const uint8_t *aFrame, size_t aLength);
+    void HandleBackboneDataFrame(const uint8_t *aFrame, size_t aLength);
     void HandleThreadFrame(const uint8_t *aFrame, size_t aLength);
     void ExpireBackboneListeners(void);
     void ReportCounters(void);
+    void ReportCounters(const char *aDirection, const Counters &aCounters, Counters &aReported);
     bool ReadBackboneMac(void);
 
     std::string                     mThreadIfName;
     std::string                     mBackboneIfName;
     bool                            mEnabled;
-    BpfTap                          mBackboneTap;
+    BpfTap                          mBackboneMldTap;
+    BpfTap                          mBackboneDataTap;
     BpfTap                          mThreadTap;
     uint8_t                         mBackboneMac[McastForwardPolicy::kMacSize];
     bool                            mHasBackboneMac;
     std::set<Ip6Address>            mThreadListeners;
     std::map<Ip6Address, Timepoint> mBackboneListeners;
     McastDedupCache                 mDedup;
-    McastRateLimiter                mRateLimiter;
+    McastRateLimiter                mThreadToBackboneLimiter;
+    McastRateLimiter                mBackboneToThreadLimiter;
     Counters                        mThreadToBackbone;
+    Counters                        mBackboneToThread;
     Counters                        mReportedThreadToBackbone;
+    Counters                        mReportedBackboneToThread;
     Timepoint                       mNextExpire;
     Timepoint                       mNextReport;
 };

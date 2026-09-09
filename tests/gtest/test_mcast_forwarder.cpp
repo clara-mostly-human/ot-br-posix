@@ -294,4 +294,62 @@ TEST(McastForwarder, ThreadPacketPipelineCountsEveryOutcome)
     EXPECT_EQ(c.mReceived, 105u);
 }
 
+TEST(McastForwarder, BackbonePacketPipelineInjectsOnlyForThreadListeners)
+{
+    McastForwarder                  forwarder("utun0", "");
+    otbr::Timepoint                 now = otbr::Clock::now();
+    std::vector<uint8_t>            packet;
+    const McastForwarder::Counters &c = forwarder.GetBackboneToThreadCounters();
+
+    // Policy first: a link-local group never enters the mesh.
+    packet = MeshPacket("fd00:1::1", "ff02::1", 64, "a");
+    forwarder.HandleBackbonePacket(packet.data(), packet.size(), now);
+    EXPECT_EQ(c.mRejected, 1u);
+
+    // No Thread device registered for the group: nothing is injected.
+    packet = MeshPacket("fd00:1::1", "ff05::abcd", 64, "hello");
+    forwarder.HandleBackbonePacket(packet.data(), packet.size(), now);
+    EXPECT_EQ(c.mNoListener, 1u);
+    EXPECT_EQ(c.mErrors, 0u);
+
+    // With a listener the packet reaches the write (and fails there: no tap).
+    forwarder.HandleBackboneMulticastListenerEvent(OT_BACKBONE_ROUTER_MULTICAST_LISTENER_ADDED,
+                                                   Ip6Address("ff05::abcd"));
+    forwarder.HandleBackbonePacket(packet.data(), packet.size(), now);
+    EXPECT_EQ(c.mErrors, 1u);
+    EXPECT_EQ(c.mForwarded, 0u);
+
+    // The same packet again is a duplicate.
+    forwarder.HandleBackbonePacket(packet.data(), packet.size(), now + otbr::Milliseconds(100));
+    EXPECT_EQ(c.mDuplicates, 1u);
+
+    // A packet the forwarder itself just emitted towards the backbone comes
+    // back through the backbone tap (see-sent): the duplicate cache catches
+    // it, so the mesh never sees its own traffic again.
+    packet = MeshPacket("fd12::1", "ff05::abcd", 64, "from-the-mesh");
+    forwarder.HandleThreadPacket(packet.data(), packet.size(), now + otbr::Milliseconds(200));
+    packet[7] = 63;
+    forwarder.HandleBackbonePacket(packet.data(), packet.size(), now + otbr::Milliseconds(201));
+    EXPECT_EQ(c.mDuplicates, 2u);
+    EXPECT_EQ(c.mErrors, 1u);
+
+    // A flood of distinct packets is held to the tighter mesh-bound limit (20 burst).
+    for (int i = 0; i < 100; i++)
+    {
+        std::string payload = "flood-" + std::to_string(i);
+
+        packet = MeshPacket("fd00:1::1", "ff05::abcd", 64, payload.c_str());
+        forwarder.HandleBackbonePacket(packet.data(), packet.size(), now + otbr::Milliseconds(300));
+    }
+    EXPECT_EQ(c.mRateLimited, 100u - 20u);
+    EXPECT_EQ(c.mErrors, 1u + 20u);
+
+    // Once the listener is gone, the group is closed again.
+    forwarder.HandleBackboneMulticastListenerEvent(OT_BACKBONE_ROUTER_MULTICAST_LISTENER_REMOVED,
+                                                   Ip6Address("ff05::abcd"));
+    packet = MeshPacket("fd00:1::1", "ff05::abcd", 64, "late");
+    forwarder.HandleBackbonePacket(packet.data(), packet.size(), now + otbr::Milliseconds(400));
+    EXPECT_EQ(c.mNoListener, 2u);
+}
+
 } // namespace
