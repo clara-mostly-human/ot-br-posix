@@ -51,6 +51,8 @@ if(OTBR_USERSPACE_MCAST_FWD)
         bpf_tap.cpp
         mcast_forwarder.hpp
         mcast_forwarder.cpp
+        mcast_policy.hpp
+        mcast_policy.cpp
     )
 endif()
 

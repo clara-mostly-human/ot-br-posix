@@ -155,6 +155,7 @@ endif()
 if(OTBR_USERSPACE_MCAST_FWD)
     add_executable(otbr-gtest-mcast-forwarder
         test_mcast_forwarder.cpp
+        test_mcast_policy.cpp
     )
     target_link_libraries(otbr-gtest-mcast-forwarder
         otbr-config
