@@ -49,6 +49,7 @@
 #include "common/time.hpp"
 #include "common/types.hpp"
 #include "host/posix/bpf_tap.hpp"
+#include "host/posix/mcast_policy.hpp"
 
 namespace otbr {
 
@@ -63,7 +64,11 @@ namespace otbr {
  * side by snooping MLD reports on the backbone interface — and moves
  * packets between the Thread interface and the backbone through BPF taps.
  *
- * Only the listener tracking is implemented so far; no packet is forwarded.
+ * Thread -> backbone: every multicast packet the Thread stack hands to the
+ * host with a scope beyond realm-local is a candidate (the same rule the
+ * Linux path applies); it is forwarded once (duplicate suppression), within
+ * per-group and overall rate limits, with its hop limit decremented.
+ * Backbone -> Thread is not implemented yet.
  */
 class McastForwarder : public MainloopProcessor, private NonCopyable
 {
@@ -75,6 +80,19 @@ public:
     {
         Ip6Address mGroup;
         bool       mIsJoin;
+    };
+
+    /**
+     * Forwarding statistics for one direction.
+     */
+    struct Counters
+    {
+        uint64_t mReceived    = 0; ///< Packets taken from the tap.
+        uint64_t mForwarded   = 0; ///< Packets written to the other side.
+        uint64_t mRejected    = 0; ///< Not forwardable (policy).
+        uint64_t mDuplicates  = 0; ///< Copies of a packet already forwarded.
+        uint64_t mRateLimited = 0; ///< Dropped by the rate limiter.
+        uint64_t mErrors      = 0; ///< Write failures.
     };
 
     /**
@@ -103,6 +121,8 @@ public:
     bool HasThreadListener(const Ip6Address &aGroup) const { return mThreadListeners.count(aGroup) != 0; }
     bool HasBackboneListener(const Ip6Address &aGroup) const { return mBackboneListeners.count(aGroup) != 0; }
 
+    const Counters &GetThreadToBackboneCounters(void) const { return mThreadToBackbone; }
+
     /**
      * Extracts the group membership changes an MLD message carries.
      *
@@ -121,6 +141,18 @@ public:
     void HandleMldRecords(const std::vector<MldRecord> &aRecords);
 
     /**
+     * Runs one IPv6 packet from the Thread side through the forwarding
+     * pipeline (policy, duplicate suppression, rate limit) and, if it
+     * passes, writes it to the backbone. Public so the pipeline can be
+     * exercised without a tap; the counters record the outcome.
+     *
+     * @param[in] aPacket  The IPv6 packet, starting at the IPv6 header.
+     * @param[in] aLength  The packet length.
+     * @param[in] aNow     The current time.
+     */
+    void HandleThreadPacket(const uint8_t *aPacket, size_t aLength, Timepoint aNow);
+
+    /**
      * Indicates whether a group is one the forwarder tracks: multicast with a
      * scope beyond link-local, the only scopes a Backbone Router carries.
      */
@@ -134,19 +166,36 @@ private:
     // Query Interval (125 s) + Query Response Interval (10 s).
     static constexpr uint32_t kBackboneListenerTimeoutSec = 260;
     static constexpr uint32_t kExpireIntervalSec          = 30;
+    static constexpr uint32_t kReportIntervalSec          = 60;
+    static constexpr uint32_t kDedupWindowMs              = 5000;
+    static constexpr size_t   kDedupEntries               = 512;
+    static constexpr size_t   kMaxFrameSize               = 1514;
 
     void Enable(void);
     void Disable(void);
+    void OpenBackboneTap(void);
+    void OpenThreadTap(void);
     void HandleMldFrame(const uint8_t *aFrame, size_t aLength);
+    void HandleThreadFrame(const uint8_t *aFrame, size_t aLength);
     void ExpireBackboneListeners(void);
+    void ReportCounters(void);
+    bool ReadBackboneMac(void);
 
     std::string                     mThreadIfName;
     std::string                     mBackboneIfName;
     bool                            mEnabled;
-    BpfTap                          mMldTap;
+    BpfTap                          mBackboneTap;
+    BpfTap                          mThreadTap;
+    uint8_t                         mBackboneMac[McastForwardPolicy::kMacSize];
+    bool                            mHasBackboneMac;
     std::set<Ip6Address>            mThreadListeners;
     std::map<Ip6Address, Timepoint> mBackboneListeners;
+    McastDedupCache                 mDedup;
+    McastRateLimiter                mRateLimiter;
+    Counters                        mThreadToBackbone;
+    Counters                        mReportedThreadToBackbone;
     Timepoint                       mNextExpire;
+    Timepoint                       mNextReport;
 };
 
 } // namespace otbr

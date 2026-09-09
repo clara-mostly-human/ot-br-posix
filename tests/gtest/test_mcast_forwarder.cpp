@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 #include <string.h>
+#include <string>
 #include <vector>
 
 #include "host/posix/mcast_forwarder.hpp"
@@ -230,6 +231,67 @@ TEST(McastForwarder, TracksOnlyMulticastBeyondLinkLocal)
     EXPECT_FALSE(McastForwarder::IsTrackedGroup(Ip6Address("ff02::1")));
     EXPECT_FALSE(McastForwarder::IsTrackedGroup(Ip6Address("ff01::1")));
     EXPECT_FALSE(McastForwarder::IsTrackedGroup(Ip6Address("fd00::1")));
+}
+
+// A minimal IPv6/UDP packet from the mesh.
+std::vector<uint8_t> MeshPacket(const char *aSource, const char *aGroup, uint8_t aHopLimit, const char *aPayload)
+{
+    std::vector<uint8_t> packet(40, 0);
+    size_t               payloadLength = 8 + strlen(aPayload);
+
+    packet[0] = 0x60;
+    packet[4] = static_cast<uint8_t>(payloadLength >> 8);
+    packet[5] = static_cast<uint8_t>(payloadLength & 0xff);
+    packet[6] = 17;
+    packet[7] = aHopLimit;
+    memcpy(&packet[8], Ip6Address(aSource).m8, 16);
+    memcpy(&packet[24], Ip6Address(aGroup).m8, 16);
+    packet.resize(40 + payloadLength, 0);
+    memcpy(&packet[48], aPayload, strlen(aPayload));
+
+    return packet;
+}
+
+TEST(McastForwarder, ThreadPacketPipelineCountsEveryOutcome)
+{
+    McastForwarder                  forwarder("utun0", "");
+    otbr::Timepoint                 now = otbr::Clock::now();
+    std::vector<uint8_t>            packet;
+    const McastForwarder::Counters &c = forwarder.GetThreadToBackboneCounters();
+
+    // Not forwardable: link-local destination, link-local source, exhausted hop limit.
+    packet = MeshPacket("fd12::1", "ff02::1", 64, "a");
+    forwarder.HandleThreadPacket(packet.data(), packet.size(), now);
+    packet = MeshPacket("fe80::1", "ff05::1", 64, "a");
+    forwarder.HandleThreadPacket(packet.data(), packet.size(), now);
+    packet = MeshPacket("fd12::1", "ff05::1", 1, "a");
+    forwarder.HandleThreadPacket(packet.data(), packet.size(), now);
+    EXPECT_EQ(c.mReceived, 3u);
+    EXPECT_EQ(c.mRejected, 3u);
+
+    // Forwardable, but no backbone tap is attached: reaches the write and fails there.
+    packet = MeshPacket("fd12::1", "ff05::abcd", 64, "hello");
+    forwarder.HandleThreadPacket(packet.data(), packet.size(), now);
+    EXPECT_EQ(c.mErrors, 1u);
+    EXPECT_EQ(c.mForwarded, 0u);
+
+    // The same packet again (even with another hop limit) is a duplicate, not another write.
+    packet[7] = 60;
+    forwarder.HandleThreadPacket(packet.data(), packet.size(), now + otbr::Milliseconds(100));
+    EXPECT_EQ(c.mDuplicates, 1u);
+    EXPECT_EQ(c.mErrors, 1u);
+
+    // A flood of distinct packets to one group hits the per-group limit (40 burst).
+    for (int i = 0; i < 100; i++)
+    {
+        std::string payload = "flood-" + std::to_string(i);
+
+        packet = MeshPacket("fd12::1", "ff05::abcd", 64, payload.c_str());
+        forwarder.HandleThreadPacket(packet.data(), packet.size(), now + otbr::Milliseconds(200));
+    }
+    EXPECT_EQ(c.mRateLimited, 100u - 40u); // burst 40: the 200 ms since the first packet refilled the token it spent
+    EXPECT_EQ(c.mErrors, 1u + 40u);
+    EXPECT_EQ(c.mReceived, 105u);
 }
 
 } // namespace
