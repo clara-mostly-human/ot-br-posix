@@ -36,6 +36,7 @@
 #include <net/if_dl.h>
 #include <netinet/in.h>
 #include <string.h>
+#include <sys/socket.h>
 
 #include "common/logging.hpp"
 
@@ -63,15 +64,26 @@ constexpr size_t kMldv2HeaderSize     = 8;  // ICMPv6 header (4) + reserved (2) 
 constexpr size_t kMldv2RecordHeadSize = 20; // type (1) + aux data len (1) + number of sources (2) + address (16)
 constexpr size_t kIp6AddressSize      = 16;
 constexpr size_t kMldv2AuxDataUnit    = 4;
+constexpr size_t kTunnelHeaderSize    = 4; // BSD tunnel interfaces prefix packets with the address family
 
 // Rate limits for forwarded multicast. Thread group traffic (Matter
 // groupcast) is a few packets per second at most; these leave headroom
 // while keeping a storm from either side well below what a mesh can absorb.
-constexpr McastRateLimiter::Config kRateLimits = {
+// Into the mesh is tighter: every injected packet is flooded (MPL) to every
+// router.
+constexpr McastRateLimiter::Config kThreadToBackboneLimits = {
     /* mPerGroupRatePerSecond */ 20,
     /* mPerGroupBurst */ 40,
     /* mTotalRatePerSecond */ 100,
     /* mTotalBurst */ 200,
+    /* mMaxGroups */ 32,
+};
+
+constexpr McastRateLimiter::Config kBackboneToThreadLimits = {
+    /* mPerGroupRatePerSecond */ 10,
+    /* mPerGroupBurst */ 20,
+    /* mTotalRatePerSecond */ 30,
+    /* mTotalBurst */ 60,
     /* mMaxGroups */ 32,
 };
 
@@ -116,9 +128,9 @@ const struct bpf_insn kIcmp6FilterEthernet[] = {
     BPF_STMT(BPF_RET | BPF_K, 0),                               // drop
 };
 
-// Accepts IPv6 packets to a multicast destination of admin-local scope or
-// larger, the only ones a Backbone Router carries. The Thread interface is a
-// tunnel (DLT_NULL, 4-byte family header).
+// Accept IPv6 packets to a multicast destination of admin-local scope or
+// larger, the only ones a Backbone Router carries: one program for tunnel
+// interfaces (DLT_NULL, 4-byte family header), one for Ethernet.
 const struct bpf_insn kForwardableMulticastFilterNull[] = {
     BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 4),           // IPv6 version nibble
     BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xf0),       //
@@ -130,6 +142,18 @@ const struct bpf_insn kForwardableMulticastFilterNull[] = {
     BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x04, 0, 1), // scope < admin-local -> drop
     BPF_STMT(BPF_RET | BPF_K, 0xffffffff),           // accept
     BPF_STMT(BPF_RET | BPF_K, 0),                    // drop
+};
+
+const struct bpf_insn kForwardableMulticastFilterEthernet[] = {
+    BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),            // EtherType
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x86dd, 0, 6), // not IPv6 -> drop
+    BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 14 + 24),       // destination[0]
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xff, 0, 4),   // not multicast -> drop
+    BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 14 + 25),       // destination[1]: flags | scope
+    BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x0f),         //
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0x04, 0, 1),   // scope < admin-local -> drop
+    BPF_STMT(BPF_RET | BPF_K, 0xffffffff),             // accept
+    BPF_STMT(BPF_RET | BPF_K, 0),                      // drop
 };
 
 template <size_t N> otbrError SetFilter(BpfTap &aTap, const struct bpf_insn (&aInsns)[N])
@@ -153,7 +177,8 @@ McastForwarder::McastForwarder(const std::string &aThreadIfName, const std::stri
     , mEnabled(false)
     , mHasBackboneMac(false)
     , mDedup(kDedupWindowMs, kDedupEntries)
-    , mRateLimiter(kRateLimits)
+    , mThreadToBackboneLimiter(kThreadToBackboneLimits)
+    , mBackboneToThreadLimiter(kBackboneToThreadLimits)
     , mNextExpire(Clock::now())
     , mNextReport(Clock::now())
 {
@@ -199,42 +224,67 @@ void McastForwarder::Enable(void)
 {
     VerifyOrExit(!mEnabled);
     mEnabled = true;
-    otbrLogNotice("Enabled: thread %s, backbone %s (thread->backbone forwarding, backbone->thread not yet)",
-                  mThreadIfName.c_str(), mBackboneIfName.empty() ? "(none)" : mBackboneIfName.c_str());
+    otbrLogNotice("Enabled: thread %s, backbone %s", mThreadIfName.c_str(),
+                  mBackboneIfName.empty() ? "(none)" : mBackboneIfName.c_str());
 
-    OpenBackboneTap();
-    OpenThreadTap();
+    if (mBackboneIfName.empty())
+    {
+        otbrLogWarning("No backbone interface; nothing is forwarded and backbone listeners are unknown");
+    }
+    else if (!ReadBackboneMac())
+    {
+        otbrLogWarning("No link address on %s; nothing is forwarded", mBackboneIfName.c_str());
+    }
+    else
+    {
+        OpenBackboneMldTap();
+        OpenBackboneDataTap();
+        OpenThreadTap();
+    }
 
 exit:
     return;
 }
 
-void McastForwarder::OpenBackboneTap(void)
+void McastForwarder::OpenBackboneMldTap(void)
 {
     otbrError error;
 
-    VerifyOrExit(!mBackboneIfName.empty(),
-                 otbrLogWarning("No backbone interface; nothing is forwarded and backbone listeners are unknown"));
-    VerifyOrExit(ReadBackboneMac(),
-                 otbrLogWarning("No link address on %s; nothing is forwarded to it", mBackboneIfName.c_str()));
-
     // The host itself may be a listener, so its own MLD reports count too.
-    error = mBackboneTap.Open(mBackboneIfName, /* aSeeSent */ true);
-    VerifyOrExit(error == OTBR_ERROR_NONE, otbrLogWarning("Cannot attach to %s", mBackboneIfName.c_str()));
+    error = mBackboneMldTap.Open(mBackboneIfName, /* aSeeSent */ true);
+    VerifyOrExit(error == OTBR_ERROR_NONE, otbrLogWarning("Cannot attach to %s for MLD", mBackboneIfName.c_str()));
 
-    switch (mBackboneTap.GetDataLinkType())
-    {
-    case DLT_NULL:
-        error = SetFilter(mBackboneTap, kIcmp6FilterNull);
-        break;
-    default:
-        error = SetFilter(mBackboneTap, kIcmp6FilterEthernet);
-        break;
-    }
+    error = mBackboneMldTap.GetDataLinkType() == DLT_NULL ? SetFilter(mBackboneMldTap, kIcmp6FilterNull)
+                                                          : SetFilter(mBackboneMldTap, kIcmp6FilterEthernet);
     if (error != OTBR_ERROR_NONE)
     {
         otbrLogWarning("Cannot install the MLD filter on %s: %s", mBackboneIfName.c_str(), strerror(errno));
-        mBackboneTap.Close();
+        mBackboneMldTap.Close();
+    }
+
+exit:
+    return;
+}
+
+void McastForwarder::OpenBackboneDataTap(void)
+{
+    otbrError error;
+
+    // Frames this host sends are included so applications on the Backbone
+    // Router itself can reach the mesh. That also shows the forwarder its
+    // own emissions; those are in the duplicate cache from when they were
+    // forwarded, and the Thread stack refuses on-mesh sources anyway.
+    error = mBackboneDataTap.Open(mBackboneIfName, /* aSeeSent */ true);
+    VerifyOrExit(error == OTBR_ERROR_NONE,
+                 otbrLogWarning("Cannot attach to %s; nothing is forwarded from it", mBackboneIfName.c_str()));
+
+    error = mBackboneDataTap.GetDataLinkType() == DLT_NULL
+                ? SetFilter(mBackboneDataTap, kForwardableMulticastFilterNull)
+                : SetFilter(mBackboneDataTap, kForwardableMulticastFilterEthernet);
+    if (error != OTBR_ERROR_NONE)
+    {
+        otbrLogWarning("Cannot install the multicast filter on %s: %s", mBackboneIfName.c_str(), strerror(errno));
+        mBackboneDataTap.Close();
     }
 
 exit:
@@ -247,13 +297,13 @@ void McastForwarder::OpenThreadTap(void)
 
     // Inbound only: the packets the Thread stack hands to the host, which
     // is everything it received from the mesh (it runs the interface in
-    // multicast-promiscuous mode), never what the host sent it.
+    // multicast-promiscuous mode), never what the host sent it. The same tap
+    // is written to for injecting packets into the mesh.
     error = mThreadTap.Open(mThreadIfName, /* aSeeSent */ false);
-    VerifyOrExit(
-        error == OTBR_ERROR_NONE,
-        otbrLogWarning("Cannot attach to %s; nothing is forwarded from the Thread network", mThreadIfName.c_str()));
+    VerifyOrExit(error == OTBR_ERROR_NONE,
+                 otbrLogWarning("Cannot attach to %s; nothing is forwarded to or from it", mThreadIfName.c_str()));
     VerifyOrExit(mThreadTap.GetDataLinkType() == DLT_NULL,
-                 otbrLogWarning("%s is not a tunnel interface (dlt %u); nothing is forwarded from it",
+                 otbrLogWarning("%s is not a tunnel interface (dlt %u); nothing is forwarded to or from it",
                                 mThreadIfName.c_str(), mThreadTap.GetDataLinkType()));
 
     error = SetFilter(mThreadTap, kForwardableMulticastFilterNull);
@@ -273,7 +323,8 @@ void McastForwarder::Disable(void)
     VerifyOrExit(mEnabled);
     mEnabled = false;
     mThreadTap.Close();
-    mBackboneTap.Close();
+    mBackboneDataTap.Close();
+    mBackboneMldTap.Close();
     mBackboneListeners.clear();
     ReportCounters();
     otbrLogNotice("Disabled");
@@ -425,7 +476,7 @@ exit:
 
 void McastForwarder::HandleMldFrame(const uint8_t *aFrame, size_t aLength)
 {
-    size_t                 linkHeader = mBackboneTap.GetLinkHeaderLength();
+    size_t                 linkHeader = mBackboneMldTap.GetLinkHeaderLength();
     std::vector<MldRecord> records;
 
     VerifyOrExit(aLength > linkHeader);
@@ -479,6 +530,17 @@ exit:
     return;
 }
 
+void McastForwarder::HandleBackboneDataFrame(const uint8_t *aFrame, size_t aLength)
+{
+    size_t linkHeader = mBackboneDataTap.GetLinkHeaderLength();
+
+    VerifyOrExit(aLength > linkHeader);
+    HandleBackbonePacket(aFrame + linkHeader, aLength - linkHeader, Clock::now());
+
+exit:
+    return;
+}
+
 void McastForwarder::HandleThreadPacket(const uint8_t *aPacket, size_t aLength, Timepoint aNow)
 {
     McastForwardPolicy::Verdict verdict;
@@ -505,7 +567,7 @@ void McastForwarder::HandleThreadPacket(const uint8_t *aPacket, size_t aLength, 
     }
 
     group = McastForwardPolicy::GetDestination(aPacket);
-    if (!mRateLimiter.Allow(group, aNow))
+    if (!mThreadToBackboneLimiter.Allow(group, aNow))
     {
         mThreadToBackbone.mRateLimited++;
         ExitNow();
@@ -516,7 +578,7 @@ void McastForwarder::HandleThreadPacket(const uint8_t *aPacket, size_t aLength, 
     VerifyOrExit(frameLength > 0, mThreadToBackbone.mRejected++);
     McastForwardPolicy::DecrementHopLimit(frame + McastForwardPolicy::kEthernetHeaderSize);
 
-    error = mBackboneTap.Write(frame, frameLength);
+    error = mBackboneDataTap.Write(frame, frameLength);
     if (error != OTBR_ERROR_NONE)
     {
         mThreadToBackbone.mErrors++;
@@ -527,6 +589,73 @@ void McastForwarder::HandleThreadPacket(const uint8_t *aPacket, size_t aLength, 
 
     mThreadToBackbone.mForwarded++;
     otbrLogDebug("thread->backbone: forwarded %s -> %s (%zu bytes)",
+                 McastForwardPolicy::GetSource(aPacket).ToString().c_str(), group.ToString().c_str(), aLength);
+
+exit:
+    return;
+}
+
+void McastForwarder::HandleBackbonePacket(const uint8_t *aPacket, size_t aLength, Timepoint aNow)
+{
+    McastForwardPolicy::Verdict verdict;
+    Ip6Address                  group;
+    uint8_t                     frame[kMaxFrameSize];
+    uint32_t                    family = AF_INET6;
+    otbrError                   error;
+
+    mBackboneToThread.mReceived++;
+
+    verdict = McastForwardPolicy::Check(aPacket, aLength);
+    if (verdict != McastForwardPolicy::kForward)
+    {
+        mBackboneToThread.mRejected++;
+        otbrLogDebug("backbone->thread: %s: %s", McastForwardPolicy::VerdictToString(verdict),
+                     McastForwardPolicy::GetDestination(aPacket).ToString().c_str());
+        ExitNow();
+    }
+
+    // Into the mesh only for groups a Thread device registered for (MLR),
+    // as the Linux path's inbound forwarding cache does: an injected packet
+    // is flooded to every router, so unrequested groups stay out.
+    group = McastForwardPolicy::GetDestination(aPacket);
+    if (!HasThreadListener(group))
+    {
+        mBackboneToThread.mNoListener++;
+        ExitNow();
+    }
+
+    if (mDedup.Check(McastDedupCache::Fingerprint(aPacket, aLength), aNow))
+    {
+        mBackboneToThread.mDuplicates++;
+        ExitNow();
+    }
+
+    if (!mBackboneToThreadLimiter.Allow(group, aNow))
+    {
+        mBackboneToThread.mRateLimited++;
+        ExitNow();
+    }
+
+    VerifyOrExit(kTunnelHeaderSize + aLength <= sizeof(frame), mBackboneToThread.mRejected++);
+
+    // A BPF write to a tunnel interface skips the framer and lands in the
+    // driver's output path, which converts the family header to the byte
+    // order the tunnel's client expects; so it goes in host order here.
+    memcpy(frame, &family, kTunnelHeaderSize);
+    memcpy(frame + kTunnelHeaderSize, aPacket, aLength);
+    McastForwardPolicy::DecrementHopLimit(frame + kTunnelHeaderSize);
+
+    error = mThreadTap.Write(frame, kTunnelHeaderSize + aLength);
+    if (error != OTBR_ERROR_NONE)
+    {
+        mBackboneToThread.mErrors++;
+        otbrLogDebug("backbone->thread: write to %s failed: %s", mThreadIfName.c_str(),
+                     error == OTBR_ERROR_INVALID_STATE ? "not attached" : strerror(errno));
+        ExitNow();
+    }
+
+    mBackboneToThread.mForwarded++;
+    otbrLogDebug("backbone->thread: forwarded %s -> %s (%zu bytes)",
                  McastForwardPolicy::GetSource(aPacket).ToString().c_str(), group.ToString().c_str(), aLength);
 
 exit:
@@ -553,15 +682,21 @@ void McastForwarder::ExpireBackboneListeners(void)
 
 void McastForwarder::ReportCounters(void)
 {
-    const Counters &c = mThreadToBackbone;
+    ReportCounters("thread->backbone", mThreadToBackbone, mReportedThreadToBackbone);
+    ReportCounters("backbone->thread", mBackboneToThread, mReportedBackboneToThread);
+}
 
-    VerifyOrExit(memcmp(&c, &mReportedThreadToBackbone, sizeof(Counters)) != 0);
-    otbrLogInfo("thread->backbone: received %llu forwarded %llu rejected %llu duplicates %llu rate-limited %llu "
-                "errors %llu",
-                static_cast<unsigned long long>(c.mReceived), static_cast<unsigned long long>(c.mForwarded),
-                static_cast<unsigned long long>(c.mRejected), static_cast<unsigned long long>(c.mDuplicates),
-                static_cast<unsigned long long>(c.mRateLimited), static_cast<unsigned long long>(c.mErrors));
-    mReportedThreadToBackbone = c;
+void McastForwarder::ReportCounters(const char *aDirection, const Counters &aCounters, Counters &aReported)
+{
+    VerifyOrExit(memcmp(&aCounters, &aReported, sizeof(Counters)) != 0);
+    otbrLogInfo(
+        "%s: received %llu forwarded %llu rejected %llu no-listener %llu duplicates %llu rate-limited %llu "
+        "errors %llu",
+        aDirection, static_cast<unsigned long long>(aCounters.mReceived),
+        static_cast<unsigned long long>(aCounters.mForwarded), static_cast<unsigned long long>(aCounters.mRejected),
+        static_cast<unsigned long long>(aCounters.mNoListener), static_cast<unsigned long long>(aCounters.mDuplicates),
+        static_cast<unsigned long long>(aCounters.mRateLimited), static_cast<unsigned long long>(aCounters.mErrors));
+    aReported = aCounters;
 
 exit:
     return;
@@ -571,13 +706,12 @@ void McastForwarder::Update(MainloopContext &aMainloop)
 {
     VerifyOrExit(mEnabled);
 
-    if (mBackboneTap.IsOpen())
+    for (BpfTap *tap : {&mBackboneMldTap, &mBackboneDataTap, &mThreadTap})
     {
-        aMainloop.AddFdToReadSet(mBackboneTap.GetFd());
-    }
-    if (mThreadTap.IsOpen())
-    {
-        aMainloop.AddFdToReadSet(mThreadTap.GetFd());
+        if (tap->IsOpen())
+        {
+            aMainloop.AddFdToReadSet(tap->GetFd());
+        }
     }
 
     {
@@ -602,10 +736,21 @@ void McastForwarder::Process(const MainloopContext &aMainloop)
 {
     VerifyOrExit(mEnabled);
 
-    if (mBackboneTap.IsOpen() && FD_ISSET(mBackboneTap.GetFd(), &aMainloop.mReadFdSet))
+    if (mBackboneMldTap.IsOpen() && FD_ISSET(mBackboneMldTap.GetFd(), &aMainloop.mReadFdSet))
     {
         otbrError error =
-            mBackboneTap.Read([this](const uint8_t *aFrame, size_t aLength) { HandleMldFrame(aFrame, aLength); });
+            mBackboneMldTap.Read([this](const uint8_t *aFrame, size_t aLength) { HandleMldFrame(aFrame, aLength); });
+
+        if (error != OTBR_ERROR_NONE)
+        {
+            otbrLogWarning("Reading MLD from %s failed: %s", mBackboneIfName.c_str(), strerror(errno));
+        }
+    }
+
+    if (mBackboneDataTap.IsOpen() && FD_ISSET(mBackboneDataTap.GetFd(), &aMainloop.mReadFdSet))
+    {
+        otbrError error = mBackboneDataTap.Read(
+            [this](const uint8_t *aFrame, size_t aLength) { HandleBackboneDataFrame(aFrame, aLength); });
 
         if (error != OTBR_ERROR_NONE)
         {
