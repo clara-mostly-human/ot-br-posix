@@ -199,8 +199,8 @@ private:
     void HandleBackboneDataFrame(const uint8_t *aFrame, size_t aLength);
     void HandleThreadFrame(const uint8_t *aFrame, size_t aLength);
     void ExpireBackboneListeners(void);
-    void ReportCounters(void);
-    void ReportCounters(const char *aDirection, const Counters &aCounters, Counters &aReported);
+    void ReportCounters(bool aForce);
+    void ReportCounters(const char *aDirection, const Counters &aCounters, Counters &aReported, bool aForce);
     bool ReadBackboneMac(void);
 
     std::string                     mThreadIfName;
