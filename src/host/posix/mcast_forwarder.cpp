@@ -326,7 +326,7 @@ void McastForwarder::Disable(void)
     mBackboneDataTap.Close();
     mBackboneMldTap.Close();
     mBackboneListeners.clear();
-    ReportCounters();
+    ReportCounters(/* aForce */ true);
     otbrLogNotice("Disabled");
 
 exit:
@@ -680,15 +680,17 @@ void McastForwarder::ExpireBackboneListeners(void)
     }
 }
 
-void McastForwarder::ReportCounters(void)
+// Periodic reports are skipped while nothing changes; the report on disable
+// is always written so a shutdown leaves the final numbers in the log.
+void McastForwarder::ReportCounters(bool aForce)
 {
-    ReportCounters("thread->backbone", mThreadToBackbone, mReportedThreadToBackbone);
-    ReportCounters("backbone->thread", mBackboneToThread, mReportedBackboneToThread);
+    ReportCounters("thread->backbone", mThreadToBackbone, mReportedThreadToBackbone, aForce);
+    ReportCounters("backbone->thread", mBackboneToThread, mReportedBackboneToThread, aForce);
 }
 
-void McastForwarder::ReportCounters(const char *aDirection, const Counters &aCounters, Counters &aReported)
+void McastForwarder::ReportCounters(const char *aDirection, const Counters &aCounters, Counters &aReported, bool aForce)
 {
-    VerifyOrExit(memcmp(&aCounters, &aReported, sizeof(Counters)) != 0);
+    VerifyOrExit(aForce || memcmp(&aCounters, &aReported, sizeof(Counters)) != 0);
     otbrLogInfo(
         "%s: received %llu forwarded %llu rejected %llu no-listener %llu duplicates %llu rate-limited %llu "
         "errors %llu",
@@ -776,7 +778,7 @@ void McastForwarder::Process(const MainloopContext &aMainloop)
     }
     if (Clock::now() >= mNextReport)
     {
-        ReportCounters();
+        ReportCounters(/* aForce */ false);
         mNextReport = Clock::now() + Seconds(kReportIntervalSec);
     }
 
