@@ -1561,11 +1561,20 @@ exit:
         otbrLogInfo("Will re-resolve service instance %s on the retryable error: %s", mInstanceInfo.mName.c_str(),
                     DNSErrorToString(aErrorCode));
 
-        mPublisher.ScheduleRetry<ServiceInstanceResolution>(this,
-                                                            [aInterfaceIndex](ServiceInstanceResolution *aInstance) {
-                                                                aInstance->Release();
-                                                                aInstance->GetAddrInfo(aInterfaceIndex);
-                                                            });
+        // Only the address lookup is retried: `Release()` would also discard the resolved service (host name, port,
+        // TXT data), leaving nothing to look up or to report.
+        mPublisher.ScheduleRetry<ServiceInstanceResolution>(
+            this, [aInterfaceIndex](ServiceInstanceResolution *aInstance) {
+                aInstance->DeallocateServiceRef();
+                aInstance->mInstanceInfo.mAddresses.clear();
+
+                if (aInstance->GetAddrInfo(aInterfaceIndex) != OTBR_ERROR_NONE)
+                {
+                    aInstance->mSubscription->mPublisher.OnServiceResolveFailed(
+                        aInstance->mSubscription->mType, aInstance->mInstanceName, kDNSServiceErr_Unknown);
+                    aInstance->FinishResolution();
+                }
+            });
     }
     else if ((!mInstanceInfo.mAddresses.empty() && !moreComing) || aErrorCode != kDNSServiceErr_NoError)
     {
