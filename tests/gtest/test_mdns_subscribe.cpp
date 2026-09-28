@@ -28,8 +28,13 @@
 
 #include <gtest/gtest.h>
 #include <limits.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <set>
 #include <vector>
@@ -142,6 +147,31 @@ std::unique_ptr<Publisher> CreatePublisher(void)
     return publisher;
 }
 
+#if OTBR_ENABLE_MDNS_MDNSSD
+// mDNSResponder reports what this host publishes on the loopback interface as well as on the interfaces it is
+// reachable through. Subscribers are to see the latter only.
+bool IsLoopbackInterface(uint32_t aNetifIndex)
+{
+    bool         isLoopback = false;
+    int          sock       = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct ifreq ifReq;
+
+    memset(&ifReq, 0, sizeof(ifReq));
+
+    if (sock >= 0 && if_indextoname(aNetifIndex, ifReq.ifr_name) != nullptr && ioctl(sock, SIOCGIFFLAGS, &ifReq) == 0)
+    {
+        isLoopback = (ifReq.ifr_flags & IFF_LOOPBACK) != 0;
+    }
+
+    if (sock >= 0)
+    {
+        close(sock);
+    }
+
+    return isLoopback;
+}
+#endif
+
 void CheckServiceInstance(const Publisher::DiscoveredInstanceInfo aInstanceInfo,
                           bool                                    aRemoved,
                           const std::string                      &aHostName,
@@ -158,6 +188,9 @@ void CheckServiceInstance(const Publisher::DiscoveredInstanceInfo aInstanceInfo,
         EXPECT_EQ(AsSet(aAddresses), AsSet(aInstanceInfo.mAddresses));
         EXPECT_EQ(aPort, aInstanceInfo.mPort);
         EXPECT_TRUE(AsTxtMap(aTxtData) == AsTxtMap(aInstanceInfo.mTxtData));
+#if OTBR_ENABLE_MDNS_MDNSSD
+        EXPECT_FALSE(IsLoopbackInterface(aInstanceInfo.mNetifIndex));
+#endif
     }
 }
 
@@ -182,6 +215,9 @@ void CheckHostAdded(const Publisher::DiscoveredHostInfo &aHostInfo,
 {
     EXPECT_EQ(aHostName, aHostInfo.mHostName);
     EXPECT_EQ(AsSet(aAddresses), AsSet(aHostInfo.mAddresses));
+#if OTBR_ENABLE_MDNS_MDNSSD
+    EXPECT_FALSE(IsLoopbackInterface(aHostInfo.mNetifIndex));
+#endif
 }
 
 TEST_F(MdnsTest, SubscribeHost)

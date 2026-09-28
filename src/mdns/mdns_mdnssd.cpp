@@ -41,15 +41,20 @@
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "common/code_utils.hpp"
 #include "common/logging.hpp"
 #include "common/time.hpp"
 #include "utils/dns_utils.hpp"
+#include "utils/socket_utils.hpp"
 #include "utils/string_utils.hpp"
 
 // kDNSServiceErr_StaleData entered dns_sd.h with mDNSResponder 2559 (the
@@ -69,6 +74,33 @@ namespace Mdns {
 static const char kDomain[] = "local.";
 
 const Milliseconds PublisherMDnsSd::kRetryDelay(5000); // 5 seconds
+
+// mDNSResponder reports the services and addresses of this host on the loopback interface as well as on the
+// interfaces they are reachable through, the loopback report first. A subscriber is to see the latter: beyond this
+// host, a service on the loopback interface and the addresses of that interface (`::1`, `fe80::1`) lead nowhere.
+static bool IsLoopbackInterface(uint32_t aInterfaceIndex)
+{
+    bool         isLoopback = false;
+    int          sock       = -1;
+    struct ifreq ifReq;
+
+    memset(&ifReq, 0, sizeof(ifReq));
+    VerifyOrExit(if_indextoname(aInterfaceIndex, ifReq.ifr_name) != nullptr);
+
+    sock = SocketWithCloseExec(AF_INET6, SOCK_DGRAM, IPPROTO_IP, kSocketBlock);
+    VerifyOrExit(sock != -1);
+    VerifyOrExit(ioctl(sock, SIOCGIFFLAGS, &ifReq) != -1);
+
+    isLoopback = (ifReq.ifr_flags & IFF_LOOPBACK) != 0;
+
+exit:
+    if (sock != -1)
+    {
+        close(sock);
+    }
+
+    return isLoopback;
+}
 
 static otbrError DNSErrorToOtbrError(DNSServiceErrorType aError)
 {
@@ -1259,6 +1291,7 @@ void PublisherMDnsSd::ServiceSubscription::HandleBrowseResult(DNSServiceRef     
                 aErrorCode);
 
     VerifyOrExit(aErrorCode == kDNSServiceErr_NoError);
+    VerifyOrExit(!IsLoopbackInterface(aInterfaceIndex));
 
     if (aFlags & kDNSServiceFlagsAdd)
     {
@@ -1401,6 +1434,8 @@ void PublisherMDnsSd::ServiceInstanceResolution::HandleResolveResult(DNSServiceR
                 aTxtLen, aInterfaceIndex, aFlags);
 
     VerifyOrExit(aErrorCode == kDNSServiceErr_NoError);
+    // Keep resolving: the reply on the interface the service is reachable through follows.
+    VerifyOrExit(!IsLoopbackInterface(aInterfaceIndex));
 
     SuccessOrExit(error = DnsUtils::SplitFullServiceInstanceName(aFullName, instanceName, type, domain));
 
@@ -1480,7 +1515,6 @@ void PublisherMDnsSd::ServiceInstanceResolution::HandleGetAddrInfoResult(DNSServ
                                                                          uint32_t               aTtl)
 {
     OTBR_UNUSED_VARIABLE(aServiceRef);
-    OTBR_UNUSED_VARIABLE(aInterfaceIndex);
 
     Ip6Address address;
     bool       isAdd;
@@ -1504,6 +1538,9 @@ void PublisherMDnsSd::ServiceInstanceResolution::HandleGetAddrInfoResult(DNSServ
                                                               static_cast<unsigned int>(aAddress->sa_family)));
     VerifyOrExit(!address.IsUnspecified() && !address.IsMulticast() && !address.IsLoopback(),
                  otbrLogDebug("DNSServiceGetAddrInfo ignores address %s", address.ToString().c_str()));
+    VerifyOrExit(
+        !IsLoopbackInterface(aInterfaceIndex),
+        otbrLogDebug("DNSServiceGetAddrInfo ignores address %s on a loopback interface", address.ToString().c_str()));
 
     otbrLogInfo("DNSServiceGetAddrInfo reply: %s address=%s, ttl=%" PRIu32, isAdd ? "add" : "remove",
                 address.ToString().c_str(), aTtl);
@@ -1612,6 +1649,9 @@ void PublisherMDnsSd::HostSubscription::HandleResolveResult(DNSServiceRef       
                                                               static_cast<unsigned int>(aAddress->sa_family)));
     VerifyOrExit(!address.IsUnspecified() && !address.IsMulticast() && !address.IsLoopback(),
                  otbrLogDebug("DNSServiceGetAddrInfo ignores address %s", address.ToString().c_str()));
+    VerifyOrExit(
+        !IsLoopbackInterface(aInterfaceIndex),
+        otbrLogDebug("DNSServiceGetAddrInfo ignores address %s on a loopback interface", address.ToString().c_str()));
 
     otbrLogInfo("DNSServiceGetAddrInfo reply: %s address=%s, ttl=%" PRIu32, isAdd ? "add" : "remove",
                 address.ToString().c_str(), aTtl);
