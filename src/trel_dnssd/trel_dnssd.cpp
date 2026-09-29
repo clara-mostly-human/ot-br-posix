@@ -121,7 +121,7 @@ void TrelDnssd::StartBrowse(void)
 
     if (IsReady())
     {
-        mPublisher.SubscribeService(kTrelServiceName, /* aInstanceName */ "");
+        mPublisher.SubscribeService(kTrelServiceName, /* aInstanceName */ "", Mdns::Publisher::kNetifIndexAny);
     }
 
 exit:
@@ -140,7 +140,7 @@ void TrelDnssd::StopBrowse(void)
 
     if (IsReady())
     {
-        mPublisher.UnsubscribeService(kTrelServiceName, "");
+        mPublisher.UnsubscribeService(kTrelServiceName, "", Mdns::Publisher::kNetifIndexAny);
     }
 
 exit:
@@ -465,7 +465,7 @@ void TrelDnssd::OnBecomeReady(void)
 
         if (mSubscriberId > 0)
         {
-            mPublisher.SubscribeService(kTrelServiceName, /* aInstanceName */ "");
+            mPublisher.SubscribeService(kTrelServiceName, /* aInstanceName */ "", Mdns::Publisher::kNetifIndexAny);
         }
 
         if (mRegisterInfo.IsValid())

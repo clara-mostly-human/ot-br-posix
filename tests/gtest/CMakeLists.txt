@@ -150,6 +150,7 @@ if(OTBR_MDNS AND NOT OTBR_MDNS STREQUAL "openthread")
     target_link_libraries(otbr-gtest-mdns-subscribe
         otbr-common
         otbr-mdns
+        otbr-posix
         GTest::gmock_main
     )
     gtest_discover_tests(otbr-gtest-mdns-subscribe)

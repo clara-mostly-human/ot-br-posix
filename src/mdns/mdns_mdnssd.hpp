@@ -69,12 +69,12 @@ public:
 
     void UnpublishService(const std::string &aName, const std::string &aType, ResultCallback &&aCallback) override;
 
-    void      UnpublishHost(const std::string &aName, ResultCallback &&aCallback) override;
-    void      UnpublishKey(const std::string &aName, ResultCallback &&aCallback) override;
-    void      SubscribeService(const std::string &aType, const std::string &aInstanceName) override;
-    void      UnsubscribeService(const std::string &aType, const std::string &aInstanceName) override;
-    void      SubscribeHost(const std::string &aHostName) override;
-    void      UnsubscribeHost(const std::string &aHostName) override;
+    void UnpublishHost(const std::string &aName, ResultCallback &&aCallback) override;
+    void UnpublishKey(const std::string &aName, ResultCallback &&aCallback) override;
+    void SubscribeService(const std::string &aType, const std::string &aInstanceName, uint32_t aNetifIndex) override;
+    void UnsubscribeService(const std::string &aType, const std::string &aInstanceName, uint32_t aNetifIndex) override;
+    void SubscribeHost(const std::string &aHostName, uint32_t aNetifIndex) override;
+    void UnsubscribeHost(const std::string &aHostName, uint32_t aNetifIndex) override;
     otbrError Start(void) override;
     bool      IsStarted(void) const override;
     void      Stop(void) override { Stop(kNormalStop); }
@@ -284,11 +284,20 @@ private:
 
     struct ServiceSubscription : public ServiceRef, public std::enable_shared_from_this<ServiceSubscription>
     {
-        explicit ServiceSubscription(PublisherMDnsSd &aPublisher, std::string aType, std::string aInstanceName)
+        explicit ServiceSubscription(PublisherMDnsSd &aPublisher,
+                                     std::string      aType,
+                                     std::string      aInstanceName,
+                                     uint32_t         aNetifIndex)
             : ServiceRef(aPublisher)
             , mType(std::move(aType))
             , mInstanceName(std::move(aInstanceName))
+            , mNetifIndex(aNetifIndex)
         {
+        }
+
+        bool Matches(const std::string &aType, const std::string &aInstanceName, uint32_t aNetifIndex) const
+        {
+            return mType == aType && mInstanceName == aInstanceName && mNetifIndex == aNetifIndex;
         }
 
         void Release(void);
@@ -322,16 +331,23 @@ private:
 
         std::string mType;
         std::string mInstanceName;
+        uint32_t    mNetifIndex; // The network interface to look on, or `kNetifIndexAny`.
 
         std::vector<std::shared_ptr<ServiceInstanceResolution>> mResolvingInstances;
     };
 
     struct HostSubscription : public ServiceRef, public std::enable_shared_from_this<HostSubscription>
     {
-        explicit HostSubscription(PublisherMDnsSd &aPublisher, std::string aHostName)
+        explicit HostSubscription(PublisherMDnsSd &aPublisher, std::string aHostName, uint32_t aNetifIndex)
             : ServiceRef(aPublisher)
             , mHostName(std::move(aHostName))
+            , mNetifIndex(aNetifIndex)
         {
+        }
+
+        bool Matches(const std::string &aHostName, uint32_t aNetifIndex) const
+        {
+            return mHostName == aHostName && mNetifIndex == aNetifIndex;
         }
 
         void        Release(void);
@@ -353,6 +369,7 @@ private:
                                         uint32_t               aTtl);
 
         std::string        mHostName;
+        uint32_t           mNetifIndex; // The network interface to look on, or `kNetifIndexAny`.
         DiscoveredHostInfo mHostInfo;
     };
 

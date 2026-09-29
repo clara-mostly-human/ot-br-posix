@@ -68,6 +68,10 @@ namespace Mdns {
 
 static const char kDomain[] = "local.";
 
+// The network interface index of a subscription is given to the dns_sd API as it is.
+static_assert(Publisher::kNetifIndexAny == kDNSServiceInterfaceIndexAny,
+              "kNetifIndexAny must be equal to kDNSServiceInterfaceIndexAny");
+
 const Milliseconds PublisherMDnsSd::kRetryDelay(5000); // 5 seconds
 
 static otbrError DNSErrorToOtbrError(DNSServiceErrorType aError)
@@ -1062,13 +1066,13 @@ std::string PublisherMDnsSd::MakeRegType(const std::string &aType, SubTypeList a
     return regType;
 }
 
-void PublisherMDnsSd::SubscribeService(const std::string &aType, const std::string &aInstanceName)
+void PublisherMDnsSd::SubscribeService(const std::string &aType, const std::string &aInstanceName, uint32_t aNetifIndex)
 {
     VerifyOrExit(mState == Publisher::State::kReady);
-    mSubscribedServices.push_back(std::make_shared<ServiceSubscription>(*this, aType, aInstanceName));
+    mSubscribedServices.push_back(std::make_shared<ServiceSubscription>(*this, aType, aInstanceName, aNetifIndex));
 
-    otbrLogInfo("Subscribe service %s.%s (total %zu)", aInstanceName.c_str(), aType.c_str(),
-                mSubscribedServices.size());
+    otbrLogInfo("Subscribe service %s.%s inf %" PRIu32 " (total %zu)", aInstanceName.c_str(), aType.c_str(),
+                aNetifIndex, mSubscribedServices.size());
 
     if (aInstanceName.empty())
     {
@@ -1076,28 +1080,30 @@ void PublisherMDnsSd::SubscribeService(const std::string &aType, const std::stri
     }
     else
     {
-        mSubscribedServices.back()->Resolve(kDNSServiceInterfaceIndexAny, aInstanceName, aType, kDomain);
+        mSubscribedServices.back()->Resolve(aNetifIndex, aInstanceName, aType, kDomain);
     }
 
 exit:
     return;
 }
 
-void PublisherMDnsSd::UnsubscribeService(const std::string &aType, const std::string &aInstanceName)
+void PublisherMDnsSd::UnsubscribeService(const std::string &aType,
+                                         const std::string &aInstanceName,
+                                         uint32_t           aNetifIndex)
 {
     ServiceSubscriptionList::iterator it;
 
     VerifyOrExit(mState == Publisher::State::kReady);
     it = std::find_if(mSubscribedServices.begin(), mSubscribedServices.end(),
-                      [&aType, &aInstanceName](const std::shared_ptr<ServiceSubscription> &aService) {
-                          return aService->mType == aType && aService->mInstanceName == aInstanceName;
+                      [&aType, &aInstanceName, aNetifIndex](const std::shared_ptr<ServiceSubscription> &aService) {
+                          return aService->Matches(aType, aInstanceName, aNetifIndex);
                       });
     VerifyOrExit(it != mSubscribedServices.end());
 
     mSubscribedServices.erase(it);
 
-    otbrLogInfo("Unsubscribe service %s.%s (left %zu)", aInstanceName.c_str(), aType.c_str(),
-                mSubscribedServices.size());
+    otbrLogInfo("Unsubscribe service %s.%s inf %" PRIu32 " (left %zu)", aInstanceName.c_str(), aType.c_str(),
+                aNetifIndex, mSubscribedServices.size());
 
 exit:
     return;
@@ -1120,12 +1126,13 @@ otbrError PublisherMDnsSd::DnsErrorToOtbrError(int32_t aErrorCode)
     return otbr::Mdns::DNSErrorToOtbrError(aErrorCode);
 }
 
-void PublisherMDnsSd::SubscribeHost(const std::string &aHostName)
+void PublisherMDnsSd::SubscribeHost(const std::string &aHostName, uint32_t aNetifIndex)
 {
     VerifyOrExit(mState == State::kReady);
-    mSubscribedHosts.push_back(std::make_shared<HostSubscription>(*this, aHostName));
+    mSubscribedHosts.push_back(std::make_shared<HostSubscription>(*this, aHostName, aNetifIndex));
 
-    otbrLogInfo("Subscribe host %s (total %zu)", aHostName.c_str(), mSubscribedHosts.size());
+    otbrLogInfo("Subscribe host %s inf %" PRIu32 " (total %zu)", aHostName.c_str(), aNetifIndex,
+                mSubscribedHosts.size());
 
     mSubscribedHosts.back()->Resolve();
 
@@ -1133,20 +1140,22 @@ exit:
     return;
 }
 
-void PublisherMDnsSd::UnsubscribeHost(const std::string &aHostName)
+void PublisherMDnsSd::UnsubscribeHost(const std::string &aHostName, uint32_t aNetifIndex)
 {
     HostSubscriptionList ::iterator it;
 
     VerifyOrExit(mState == Publisher::State::kReady);
-    it = std::find_if(
-        mSubscribedHosts.begin(), mSubscribedHosts.end(),
-        [&aHostName](const std::shared_ptr<HostSubscription> &aHost) { return aHost->mHostName == aHostName; });
+    it = std::find_if(mSubscribedHosts.begin(), mSubscribedHosts.end(),
+                      [&aHostName, aNetifIndex](const std::shared_ptr<HostSubscription> &aHost) {
+                          return aHost->Matches(aHostName, aNetifIndex);
+                      });
 
     VerifyOrExit(it != mSubscribedHosts.end());
 
     mSubscribedHosts.erase(it);
 
-    otbrLogInfo("Unsubscribe host %s (remaining %d)", aHostName.c_str(), mSubscribedHosts.size());
+    otbrLogInfo("Unsubscribe host %s inf %" PRIu32 " (remaining %zu)", aHostName.c_str(), aNetifIndex,
+                mSubscribedHosts.size());
 
 exit:
     return;
@@ -1225,8 +1234,8 @@ void PublisherMDnsSd::ServiceSubscription::Browse(void)
 {
     assert(mServiceRef == nullptr);
 
-    otbrLogInfo("DNSServiceBrowse %s", mType.c_str());
-    DNSServiceBrowse(&mServiceRef, /* flags */ 0, kDNSServiceInterfaceIndexAny, mType.c_str(),
+    otbrLogInfo("DNSServiceBrowse %s inf %" PRIu32, mType.c_str(), mNetifIndex);
+    DNSServiceBrowse(&mServiceRef, /* flags */ 0, mNetifIndex, mType.c_str(),
                      /* domain */ nullptr, HandleBrowseResult, this);
 }
 
@@ -1560,11 +1569,10 @@ void PublisherMDnsSd::HostSubscription::Resolve(void)
 
     mPublisher.mHostResolutionBeginTime[mHostName] = Clock::now();
 
-    otbrLogInfo("DNSServiceGetAddrInfo %s inf %d", fullHostName.c_str(), kDNSServiceInterfaceIndexAny);
+    otbrLogInfo("DNSServiceGetAddrInfo %s inf %" PRIu32, fullHostName.c_str(), mNetifIndex);
 
-    DNSServiceGetAddrInfo(&mServiceRef, /* flags */ 0, kDNSServiceInterfaceIndexAny,
-                          kDNSServiceProtocol_IPv6 | kDNSServiceProtocol_IPv4, fullHostName.c_str(),
-                          HandleResolveResult, this);
+    DNSServiceGetAddrInfo(&mServiceRef, /* flags */ 0, mNetifIndex, kDNSServiceProtocol_IPv6 | kDNSServiceProtocol_IPv4,
+                          fullHostName.c_str(), HandleResolveResult, this);
 }
 
 void PublisherMDnsSd::HostSubscription::HandleResolveResult(DNSServiceRef          aServiceRef,
