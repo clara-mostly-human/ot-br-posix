@@ -30,6 +30,13 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <dns_sd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#endif
 
 #include <set>
 #include <vector>
@@ -142,6 +149,47 @@ std::unique_ptr<Publisher> CreatePublisher(void)
     return publisher;
 }
 
+#ifdef __APPLE__
+bool IsLoopbackNetif(uint32_t aNetifIndex)
+{
+    bool            isLoopback = false;
+    struct ifaddrs *ifAddrs    = nullptr;
+
+    if (getifaddrs(&ifAddrs) != 0)
+    {
+        ifAddrs = nullptr;
+    }
+
+    for (const struct ifaddrs *ifAddr = ifAddrs; ifAddr != nullptr; ifAddr = ifAddr->ifa_next)
+    {
+        if (if_nametoindex(ifAddr->ifa_name) == aNetifIndex)
+        {
+            isLoopback = (ifAddr->ifa_flags & IFF_LOOPBACK) != 0;
+            break;
+        }
+    }
+
+    if (ifAddrs != nullptr)
+    {
+        freeifaddrs(ifAddrs);
+    }
+
+    return isLoopback;
+}
+#endif
+
+// On Apple platforms, mDNSResponder reports what this host publishes on the loopback interface in addition to the
+// interfaces it can be reached through. Subscribers must be notified for the latter only. There is nothing to check
+// on other platforms, where mDNSResponder uses the loopback interface only as a fallback.
+void ExpectNotOnLoopback(uint32_t aNetifIndex)
+{
+#ifdef __APPLE__
+    EXPECT_FALSE(IsLoopbackNetif(aNetifIndex)) << "notified on the loopback interface " << aNetifIndex;
+#else
+    OTBR_UNUSED_VARIABLE(aNetifIndex);
+#endif
+}
+
 void CheckServiceInstance(const Publisher::DiscoveredInstanceInfo aInstanceInfo,
                           bool                                    aRemoved,
                           const std::string                      &aHostName,
@@ -198,6 +246,7 @@ TEST_F(MdnsTest, SubscribeHost)
     pub->AddSubscriptionCallbacks(
         nullptr,
         [&lastHostName, &lastHostInfo](const std::string &aHostName, const Publisher::DiscoveredHostInfo &aHostInfo) {
+            ExpectNotOnLoopback(aHostInfo.mNetifIndex);
             lastHostName = aHostName;
             lastHostInfo = aHostInfo;
         });
@@ -237,6 +286,7 @@ TEST_F(MdnsTest, SubscribeServiceInstance)
     pub->AddSubscriptionCallbacks(
         [&lastServiceType, &lastInstanceInfo](const std::string                &aType,
                                               Publisher::DiscoveredInstanceInfo aInstanceInfo) {
+            ExpectNotOnLoopback(aInstanceInfo.mNetifIndex);
             lastServiceType  = aType;
             lastInstanceInfo = aInstanceInfo;
         },
@@ -277,6 +327,7 @@ TEST_F(MdnsTest, SubscribeServiceType)
     pub->AddSubscriptionCallbacks(
         [&lastServiceType, &lastInstanceInfo](const std::string                &aType,
                                               Publisher::DiscoveredInstanceInfo aInstanceInfo) {
+            ExpectNotOnLoopback(aInstanceInfo.mNetifIndex);
             lastServiceType  = aType;
             lastInstanceInfo = aInstanceInfo;
         },
@@ -325,3 +376,151 @@ TEST_F(MdnsTest, SubscribeServiceType)
     CheckServiceInstanceAdded(lastInstanceInfo, "host2.local.", {sAddr4}, "service3", 44444, {});
     clearLastInstance();
 }
+
+#ifdef __APPLE__
+const char kDomainLocal[] = "local.";
+
+void HandleRecordRegistered(DNSServiceRef       aServiceRef,
+                            DNSRecordRef        aRecordRef,
+                            DNSServiceFlags     aFlags,
+                            DNSServiceErrorType aError,
+                            void               *aContext)
+{
+    OTBR_UNUSED_VARIABLE(aServiceRef);
+    OTBR_UNUSED_VARIABLE(aRecordRef);
+    OTBR_UNUSED_VARIABLE(aFlags);
+
+    EXPECT_EQ(kDNSServiceErr_NoError, aError);
+    ++*static_cast<int *>(aContext);
+}
+
+void RegisterAddress(DNSServiceRef aConnection,
+                     uint32_t      aNetifIndex,
+                     const char   *aFullHostName,
+                     const char   *aAddress,
+                     int          &aRegistered)
+{
+    Ip6Address   address(aAddress);
+    DNSRecordRef record;
+
+    EXPECT_EQ(kDNSServiceErr_NoError,
+              DNSServiceRegisterRecord(aConnection, &record, kDNSServiceFlagsShared, aNetifIndex, aFullHostName,
+                                       kDNSServiceType_AAAA, kDNSServiceClass_IN, sizeof(address.m8), address.m8,
+                                       /* ttl */ 0, HandleRecordRegistered, &aRegistered));
+}
+
+void ProcessResultsUntil(DNSServiceRef aConnection, const int &aCount, int aExpectedCount)
+{
+    int  fd        = DNSServiceRefSockFD(aConnection);
+    auto beginTime = Clock::now();
+
+    while (aCount < aExpectedCount && Clock::now() - beginTime < std::chrono::seconds(kTimeoutSeconds))
+    {
+        fd_set         readFdSet;
+        struct timeval timeout = {1, 0};
+
+        FD_ZERO(&readFdSet);
+        FD_SET(fd, &readFdSet);
+
+        if (select(fd + 1, &readFdSet, nullptr, nullptr, &timeout) > 0)
+        {
+            EXPECT_EQ(kDNSServiceErr_NoError, DNSServiceProcessResult(aConnection));
+        }
+    }
+}
+
+void HandleServiceRegistered(DNSServiceRef       aServiceRef,
+                             DNSServiceFlags     aFlags,
+                             DNSServiceErrorType aError,
+                             const char         *aName,
+                             const char         *aType,
+                             const char         *aDomain,
+                             void               *aContext)
+{
+    OTBR_UNUSED_VARIABLE(aServiceRef);
+    OTBR_UNUSED_VARIABLE(aFlags);
+    OTBR_UNUSED_VARIABLE(aName);
+    OTBR_UNUSED_VARIABLE(aType);
+    OTBR_UNUSED_VARIABLE(aDomain);
+
+    EXPECT_EQ(kDNSServiceErr_NoError, aError);
+    ++*static_cast<int *>(aContext);
+}
+
+// Registers a service on the loopback interface only and expects a subscriber to get no notification for it: nothing
+// beyond this host can reach it.
+TEST_F(MdnsTest, SubscribeServiceInstanceOnLoopbackOnly)
+{
+    static const char kInstanceName[] = "otbr-test-loopback-only";
+    static const char kType[]         = "_test._tcp";
+
+    uint32_t      loopbackNetifIndex = if_nametoindex("lo0");
+    DNSServiceRef registration       = nullptr;
+    int           registered         = 0;
+    int           notified           = 0;
+
+    ASSERT_NE(0u, loopbackNetifIndex);
+
+    std::unique_ptr<Publisher> pub = CreatePublisher();
+
+    ASSERT_EQ(kDNSServiceErr_NoError,
+              DNSServiceRegister(&registration, /* flags */ 0, loopbackNetifIndex, kInstanceName, kType, kDomainLocal,
+                                 /* host */ nullptr, htons(55555), /* txtLen */ 0, /* txtRecord */ nullptr,
+                                 HandleServiceRegistered, &registered));
+    ProcessResultsUntil(registration, registered, 1);
+    EXPECT_EQ(1, registered);
+
+    pub->AddSubscriptionCallbacks(
+        [&notified](const std::string &aType, Publisher::DiscoveredInstanceInfo aInstanceInfo) {
+            OTBR_UNUSED_VARIABLE(aType);
+            OTBR_UNUSED_VARIABLE(aInstanceInfo);
+            notified++;
+        },
+        nullptr);
+    pub->SubscribeService(kType, kInstanceName);
+    RunMainloopUntilTimeout(kTimeoutSeconds);
+
+    EXPECT_EQ(0, notified);
+
+    DNSServiceRefDeallocate(registration);
+}
+
+// Registers a host with one address on the loopback interface only and one on every interface, and expects a
+// subscriber to get the second one only, from an interface other than the loopback one.
+TEST_F(MdnsTest, SubscribeHostIgnoresLoopbackAddresses)
+{
+    static const char kHostName[]     = "otbr-test-loopback";
+    static const char kFullHostName[] = "otbr-test-loopback.local.";
+
+    uint32_t                      loopbackNetifIndex = if_nametoindex("lo0");
+    DNSServiceRef                 connection         = nullptr;
+    int                           registered         = 0;
+    int                           notified           = 0;
+    Publisher::DiscoveredHostInfo lastHostInfo{};
+
+    ASSERT_NE(0u, loopbackNetifIndex);
+
+    std::unique_ptr<Publisher> pub = CreatePublisher();
+
+    ASSERT_EQ(kDNSServiceErr_NoError, DNSServiceCreateConnection(&connection));
+    RegisterAddress(connection, loopbackNetifIndex, kFullHostName, "fe80::1", registered);
+    RegisterAddress(connection, kDNSServiceInterfaceIndexAny, kFullHostName, "2002::5", registered);
+    ProcessResultsUntil(connection, registered, 2);
+    EXPECT_EQ(2, registered);
+
+    pub->AddSubscriptionCallbacks(nullptr, [&notified, &lastHostInfo](const std::string                   &aHostName,
+                                                                      const Publisher::DiscoveredHostInfo &aHostInfo) {
+        EXPECT_EQ(kHostName, aHostName);
+        ExpectNotOnLoopback(aHostInfo.mNetifIndex);
+        notified++;
+        lastHostInfo = aHostInfo;
+    });
+    pub->SubscribeHost(kHostName);
+    RunMainloopUntilTimeout(kTimeoutSeconds);
+
+    EXPECT_GE(notified, 1);
+    CheckHostAdded(lastHostInfo, kFullHostName, {Ip6Address("2002::5")});
+
+    DNSServiceRefDeallocate(connection);
+}
+#endif // __APPLE__

@@ -45,11 +45,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include "common/code_utils.hpp"
 #include "common/logging.hpp"
 #include "common/time.hpp"
 #include "utils/dns_utils.hpp"
+#include "utils/socket_utils.hpp"
 #include "utils/string_utils.hpp"
 
 // kDNSServiceErr_StaleData entered dns_sd.h with mDNSResponder 2559 (the
@@ -69,6 +76,46 @@ namespace Mdns {
 static const char kDomain[] = "local.";
 
 const Milliseconds PublisherMDnsSd::kRetryDelay(5000); // 5 seconds
+
+// Tells whether to ignore a report from mDNSResponder because it was made on a loopback interface.
+//
+// On Apple platforms, mDNSResponder reports the services of this host on the loopback interface in addition to the
+// interfaces they can be reached through, and the addresses of the loopback interface among the addresses of this
+// host. Subscribers need the other reports: nothing beyond this host can use a service or an address on the loopback
+// interface.
+//
+// Other platforms are not affected. There, mDNSResponder uses the loopback interface only as a fallback, when it found
+// no other interface with an IPv4 address (`SetupInterfaceList()` in mDNSPosix.c), and the report on the loopback
+// interface can be the only one.
+static bool ShouldIgnoreLoopbackReport(uint32_t aInterfaceIndex)
+{
+#ifdef __APPLE__
+    bool         isLoopback = false;
+    int          sock       = -1;
+    struct ifreq ifReq;
+
+    memset(&ifReq, 0, sizeof(ifReq));
+    VerifyOrExit(if_indextoname(aInterfaceIndex, ifReq.ifr_name) != nullptr);
+
+    sock = SocketWithCloseExec(AF_INET6, SOCK_DGRAM, IPPROTO_IP, kSocketBlock);
+    VerifyOrExit(sock != -1);
+    VerifyOrExit(ioctl(sock, SIOCGIFFLAGS, &ifReq) != -1);
+
+    isLoopback = (ifReq.ifr_flags & IFF_LOOPBACK) != 0;
+
+exit:
+    if (sock != -1)
+    {
+        close(sock);
+    }
+
+    return isLoopback;
+#else
+    OTBR_UNUSED_VARIABLE(aInterfaceIndex);
+
+    return false;
+#endif
+}
 
 static otbrError DNSErrorToOtbrError(DNSServiceErrorType aError)
 {
@@ -1259,6 +1306,8 @@ void PublisherMDnsSd::ServiceSubscription::HandleBrowseResult(DNSServiceRef     
                 aErrorCode);
 
     VerifyOrExit(aErrorCode == kDNSServiceErr_NoError);
+    VerifyOrExit(!ShouldIgnoreLoopbackReport(aInterfaceIndex),
+                 otbrLogDebug("DNSServiceBrowse ignores the reply on a loopback interface"));
 
     if (aFlags & kDNSServiceFlagsAdd)
     {
@@ -1401,6 +1450,12 @@ void PublisherMDnsSd::ServiceInstanceResolution::HandleResolveResult(DNSServiceR
                 aTxtLen, aInterfaceIndex, aFlags);
 
     VerifyOrExit(aErrorCode == kDNSServiceErr_NoError);
+
+    // Keep resolving after a reply on a loopback interface: the resolution ends with the reply on an interface the
+    // service can be reached through. If there is none, it stays pending until the subscription is removed. That is
+    // right for a service that exists on the loopback interface only, since nothing beyond this host can reach it.
+    VerifyOrExit(!ShouldIgnoreLoopbackReport(aInterfaceIndex),
+                 otbrLogDebug("DNSServiceResolve ignores the reply on a loopback interface"));
 
     SuccessOrExit(error = DnsUtils::SplitFullServiceInstanceName(aFullName, instanceName, type, domain));
 
@@ -1612,6 +1667,9 @@ void PublisherMDnsSd::HostSubscription::HandleResolveResult(DNSServiceRef       
                                                               static_cast<unsigned int>(aAddress->sa_family)));
     VerifyOrExit(!address.IsUnspecified() && !address.IsMulticast() && !address.IsLoopback(),
                  otbrLogDebug("DNSServiceGetAddrInfo ignores address %s", address.ToString().c_str()));
+    VerifyOrExit(
+        !ShouldIgnoreLoopbackReport(aInterfaceIndex),
+        otbrLogDebug("DNSServiceGetAddrInfo ignores address %s on a loopback interface", address.ToString().c_str()));
 
     otbrLogInfo("DNSServiceGetAddrInfo reply: %s address=%s, ttl=%" PRIu32, isAdd ? "add" : "remove",
                 address.ToString().c_str(), aTtl);
