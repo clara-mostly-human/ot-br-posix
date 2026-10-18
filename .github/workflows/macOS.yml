@@ -96,3 +96,5 @@ jobs:
     - name: Test
       run: |
         cd build/otbr && CTEST_OUTPUT_ON_FAILURE=1 ctest -R 'FirewallManagerTest|PfFirewall|MdnsTest|DnssdTest|SocketUtils'
+        # The link selector test creates interfaces; it needs root (still in build/otbr).
+        sudo CTEST_OUTPUT_ON_FAILURE=1 ctest -R InfraLinkSelector
