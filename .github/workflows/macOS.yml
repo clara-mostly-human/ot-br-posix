@@ -46,7 +46,7 @@ permissions:
 jobs:
   build-check:
     name: build-check (${{ matrix.name }})
-    runs-on: macos-14
+    runs-on: macos-15
     # The simulation steps poll the agent with ot-ctl, which waits for its
     # answer without a timeout: a stuck agent would hang them forever.
     timeout-minutes: 30
@@ -126,7 +126,7 @@ jobs:
   # otbr-agent and otbr-web launchd jobs, here against a simulated radio on a pty.
   setup:
     name: script/setup
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
