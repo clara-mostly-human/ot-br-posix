@@ -466,6 +466,13 @@ void Application::InitRcpMode(const std::string &aRestListenAddress, int aRestLi
 #if OTBR_ENABLE_NAT64
     UpdateNat44Masquerade();
 #endif
+#if OTBR_ENABLE_PF
+    // pf has no event for an anchor emptied behind the agent's back (`pfctl -F
+    // all`, a reload of /etc/pf.conf by another tool), so the agent asks every
+    // kPfVerifyInterval and reinstalls, as the nftables monitor does on the
+    // kernel's notice. A reinstall that fails is fatal, as at startup.
+    SchedulePfVerify();
+#endif
 #endif
 #if OTBR_ENABLE_BACKBONE_ROUTER
     mBackboneAgent->Init();
@@ -544,6 +551,30 @@ void Application::UpdateIngressPrefixes(void)
 exit:
     return;
 }
+
+#if OTBR_ENABLE_PF
+// How often the agent checks that the pf anchor still holds its rules.
+static const Milliseconds kPfVerifyInterval(30000);
+
+void Application::SchedulePfVerify(void)
+{
+    static_cast<otbr::Host::RcpHost &>(mHost).PostTimerTask(kPfVerifyInterval, [this](void) {
+        bool      reinstalled = false;
+        otbrError error;
+
+        // DeinitRcpMode() may have torn the firewall down, or released it,
+        // before a pending task fires; then there is nothing to verify and
+        // nothing to reschedule.
+        VerifyOrExit(mFirewall != nullptr && mFirewall->IsInitialized());
+        error = mFirewall->VerifyInstalled(reinstalled);
+        SuccessOrDie(error, "Failed to reinstall the firewall!");
+        SchedulePfVerify();
+
+    exit:
+        return;
+    });
+}
+#endif
 
 #if OTBR_ENABLE_NAT64
 void Application::UpdateNat44Masquerade(void)

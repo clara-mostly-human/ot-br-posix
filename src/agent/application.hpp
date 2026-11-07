@@ -314,6 +314,7 @@ private:
 #if OTBR_ENABLE_PF
     std::unique_ptr<Firewall::PfctlProcess> mPfctl;
     std::unique_ptr<Firewall::PfFirewall>   mFirewall;
+    void                                    SchedulePfVerify(void);
 #endif
 #if OTBR_ENABLE_BACKBONE_ROUTER
     std::unique_ptr<BackboneRouter::BackboneAgent> mBackboneAgent;
