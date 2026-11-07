@@ -87,6 +87,25 @@ public:
         {
             aOutput = mNatListing;
         }
+        else if (aArgs.size() == 4 && aArgs[0] == "-a" && aArgs[2] == "-s")
+        {
+            // The anchor's own listings, as VerifyInstalled() asks for them.
+            if (mFailListings)
+            {
+                aError = "pfctl: /dev/pf: Permission denied\n";
+                error  = OTBR_ERROR_ERRNO;
+            }
+            else
+            {
+                aOutput = (aArgs[3] == "rules") ? mAnchorRules : (aArgs[3] == "Tables") ? mAnchorTables : mAnchorNat;
+            }
+        }
+        else if (mFailTableReplaces > 0 && aArgs.size() >= 5 && aArgs[4] == "-T")
+        {
+            mFailTableReplaces--;
+            aError = "pfctl: Table does not exist.\n";
+            error  = OTBR_ERROR_ERRNO;
+        }
         else if (mFailRulesetLoad && aArgs.size() >= 4 && aArgs[2] == "-f")
         {
             aError = "pfctl: Syntax error in config file: pf rules not loaded\n";
@@ -103,6 +122,14 @@ public:
     std::string            mRulesListing    = "anchor \"com.apple/*\" all\nanchor \"otbr\" all\n";
     std::string            mNatListing      = "nat-anchor \"com.apple/*\" all\nnat-anchor \"otbr\" all\n";
     bool                   mFailRulesetLoad = false;
+    // What pfctl prints for the anchor after a load: pfctl rewrites the rules
+    // in its own words, so these are listings, not the ruleset text.
+    std::string mAnchorRules       = "pass out quick on utun5 inet6 from (utun5) to any flags S/SA keep state\n"
+                                     "block drop out quick on utun5 inet6 all\n";
+    std::string mAnchorTables      = "ingress_allow_dst\ningress_deny_src\n";
+    std::string mAnchorNat         = "nat pass on en0 inet tagged otbr_thread -> (en0) round-robin\n";
+    int         mFailTableReplaces = 0;     ///< How many table replacements fail with "Table does not exist".
+    bool        mFailListings      = false; ///< Every anchor listing fails.
 };
 
 const char kIngressRuleset[] = "# Installed by otbr-agent; do not edit.\n"
@@ -316,6 +343,150 @@ TEST(PfFirewall, ReplaceIngressPrefixesRequiresIngressFilter)
 
     ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
     EXPECT_EQ(firewall.ReplaceIngressPrefixes({}, {}), OTBR_ERROR_INVALID_STATE);
+}
+
+TEST(PfFirewall, VerifyInstalledDoesNothingBeforeAnythingIsEnabled)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+    bool       reinstalled = true;
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    size_t calls = pfctl.mCalls.size();
+
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_FALSE(reinstalled);
+    EXPECT_EQ(pfctl.mCalls.size(), calls);
+}
+
+TEST(PfFirewall, VerifyInstalledIsQuietWhenTheAnchorHoldsTheRules)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+    bool       reinstalled = true;
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableIngressFilter(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.ReplaceIngressPrefixes({Ip6Prefix("fd00:1::", 64)}, {Ip6Prefix("fd00:1::", 64)}),
+              OTBR_ERROR_NONE);
+    size_t calls = pfctl.mCalls.size();
+
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_FALSE(reinstalled);
+    // Three listings, nothing else.
+    ASSERT_EQ(pfctl.mCalls.size(), calls + 3);
+    EXPECT_EQ(pfctl.mCalls[calls].Command(), "pfctl -a otbr -s rules");
+    EXPECT_EQ(pfctl.mCalls[calls + 1].Command(), "pfctl -a otbr -s Tables");
+    EXPECT_EQ(pfctl.mCalls[calls + 2].Command(), "pfctl -a otbr -s Tables");
+}
+
+TEST(PfFirewall, VerifyInstalledReinstallsAnEmptiedAnchor)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+    bool       reinstalled = false;
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableIngressFilter(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.ReplaceIngressPrefixes({Ip6Prefix("fd00:2::", 64), Ip6Prefix("fd00:1::", 64)},
+                                              {Ip6Prefix("fd00:1::", 64)}),
+              OTBR_ERROR_NONE);
+
+    // `pfctl -a otbr -F all` behind the agent's back: no rules, no tables.
+    pfctl.mAnchorRules.clear();
+    pfctl.mAnchorTables.clear();
+    size_t calls = pfctl.mCalls.size();
+
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_TRUE(reinstalled);
+    // One listing that comes back empty, then the flush, the ruleset and both
+    // tables with what they last held.
+    ASSERT_EQ(pfctl.mCalls.size(), calls + 5);
+    EXPECT_EQ(pfctl.mCalls[calls].Command(), "pfctl -a otbr -s rules");
+    EXPECT_EQ(pfctl.mCalls[calls + 1].Command(), "pfctl -a otbr -F all");
+    EXPECT_EQ(pfctl.mCalls[calls + 2].Command(), "pfctl -a otbr -f -");
+    EXPECT_EQ(pfctl.mCalls[calls + 2].mInput, kIngressRuleset);
+    EXPECT_EQ(pfctl.mCalls[calls + 3].Command(),
+              "pfctl -a otbr -t ingress_deny_src -T replace fd00:1::/64 fd00:2::/64");
+    EXPECT_EQ(pfctl.mCalls[calls + 4].Command(), "pfctl -a otbr -t ingress_allow_dst -T replace fd00:1::/64");
+}
+
+TEST(PfFirewall, VerifyInstalledReinstallsWhenATableIsGone)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+    bool       reinstalled = false;
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableIngressFilter(), OTBR_ERROR_NONE);
+
+    pfctl.mAnchorTables = "ingress_deny_src\n";
+
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_TRUE(reinstalled);
+    EXPECT_EQ(pfctl.Last().Command(), "pfctl -a otbr -t ingress_allow_dst -T flush");
+}
+
+TEST(PfFirewall, VerifyInstalledChecksTheNatRuleToo)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+    bool       reinstalled = false;
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableIngressFilter(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableNat44Masquerade("en0"), OTBR_ERROR_NONE);
+
+    size_t calls = pfctl.mCalls.size();
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_FALSE(reinstalled);
+    ASSERT_EQ(pfctl.mCalls.size(), calls + 4);
+    EXPECT_EQ(pfctl.Last().Command(), "pfctl -a otbr -s nat");
+
+    pfctl.mAnchorNat.clear();
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_TRUE(reinstalled);
+    // The reloaded ruleset carries the NAT rules again.
+    const PfctlCall &load = pfctl.mCalls[pfctl.mCalls.size() - 3];
+    EXPECT_EQ(load.Command(), "pfctl -a otbr -f -");
+    EXPECT_NE(load.mInput.find("nat pass on en0 inet tagged otbr_thread -> (en0)"), std::string::npos);
+}
+
+TEST(PfFirewall, VerifyInstalledIgnoresAListingThatFails)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+    bool       reinstalled = true;
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableIngressFilter(), OTBR_ERROR_NONE);
+
+    pfctl.mFailListings = true;
+    size_t calls        = pfctl.mCalls.size();
+    EXPECT_EQ(firewall.VerifyInstalled(reinstalled), OTBR_ERROR_NONE);
+    EXPECT_FALSE(reinstalled);
+    EXPECT_EQ(pfctl.mCalls.size(), calls + 1);
+}
+
+TEST(PfFirewall, ReplaceIngressPrefixesReinstallsWhenTheTableIsGone)
+{
+    FakePfctl  pfctl;
+    PfFirewall firewall(pfctl, "utun5");
+
+    ASSERT_EQ(firewall.Init(), OTBR_ERROR_NONE);
+    ASSERT_EQ(firewall.EnableIngressFilter(), OTBR_ERROR_NONE);
+
+    // The first replacement meets a table the anchor no longer has.
+    pfctl.mFailTableReplaces = 1;
+    size_t calls             = pfctl.mCalls.size();
+    ASSERT_EQ(firewall.ReplaceIngressPrefixes({Ip6Prefix("fd00:1::", 64)}, {Ip6Prefix("fd00:1::", 64)}),
+              OTBR_ERROR_NONE);
+    // The failed replacement, then the flush, the ruleset and both tables with the new contents.
+    ASSERT_EQ(pfctl.mCalls.size(), calls + 5);
+    EXPECT_EQ(pfctl.mCalls[calls + 1].Command(), "pfctl -a otbr -F all");
+    EXPECT_EQ(pfctl.mCalls[calls + 2].Command(), "pfctl -a otbr -f -");
+    EXPECT_EQ(pfctl.mCalls[calls + 3].Command(), "pfctl -a otbr -t ingress_deny_src -T replace fd00:1::/64");
+    EXPECT_EQ(pfctl.Last().Command(), "pfctl -a otbr -t ingress_allow_dst -T replace fd00:1::/64");
 }
 
 TEST(PfFirewall, DeinitFlushesAnchorAndReleasesReference)

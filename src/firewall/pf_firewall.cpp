@@ -370,8 +370,97 @@ otbrError PfFirewall::ReplaceIngressPrefixes(const std::vector<Ip6Prefix> &aDeny
 
     VerifyOrExit(mIngressFilterEnabled, error = OTBR_ERROR_INVALID_STATE);
 
-    SuccessOrExit(error = ReplaceTable(kIngressDenySrcTable, aDenySrc));
-    SuccessOrExit(error = ReplaceTable(kIngressAllowDstTable, aAllowDst));
+    mDenySrc  = aDenySrc;
+    mAllowDst = aAllowDst;
+
+    error = ReplaceTable(kIngressDenySrcTable, aDenySrc);
+    if (error == OTBR_ERROR_NONE)
+    {
+        error = ReplaceTable(kIngressAllowDstTable, aAllowDst);
+    }
+    if (error != OTBR_ERROR_NONE)
+    {
+        // A table pfctl cannot find means the anchor was emptied behind the
+        // agent's back (the nftables backend sees ENOENT then): put everything
+        // back, the tables' new contents included.
+        otbrLogWarning("PfFirewall: replacing a table failed; reinstalling the anchor");
+        error = Reinstall();
+    }
+
+exit:
+    otbrLogResult(error, "PfFirewall: %s", __FUNCTION__);
+    return error;
+}
+
+otbrError PfFirewall::AnchorLists(const char *aListFlag, const std::string &aNeedle, bool &aFound)
+{
+    otbrError   error;
+    std::string output;
+
+    aFound = false;
+    SuccessOrExit(error = RunPfctl({"-a", kAnchorName, "-s", aListFlag}, "", output));
+    aFound = output.find(aNeedle) != std::string::npos;
+
+exit:
+    return error;
+}
+
+otbrError PfFirewall::VerifyInstalled(bool &aReinstalled)
+{
+    otbrError error = OTBR_ERROR_NONE;
+    bool      found = true;
+
+    aReinstalled = false;
+    VerifyOrExit(mInitialized, error = OTBR_ERROR_INVALID_STATE);
+    VerifyOrExit(mIngressFilterEnabled || mNat44Enabled);
+
+    // pfctl prints the rules in its own words, so the needles are the parts
+    // every rule of ours shares: the interface for the filter, the table names,
+    // the upstream interface for the NAT rule.
+    if (mIngressFilterEnabled)
+    {
+        SuccessOrExit(error = AnchorLists("rules", "quick on " + mThreadIfName + " inet6", found));
+        VerifyOrExit(found);
+        SuccessOrExit(error = AnchorLists("Tables", kIngressDenySrcTable, found));
+        VerifyOrExit(found);
+        SuccessOrExit(error = AnchorLists("Tables", kIngressAllowDstTable, found));
+        VerifyOrExit(found);
+    }
+    if (mNat44Enabled)
+    {
+        SuccessOrExit(error = AnchorLists("nat", "nat pass on " + mUpstreamIfName + " inet", found));
+        VerifyOrExit(found);
+    }
+
+exit:
+    if (error != OTBR_ERROR_NONE && error != OTBR_ERROR_INVALID_STATE)
+    {
+        otbrLogWarning("PfFirewall: could not list the anchor: %s", otbrErrorString(error));
+        error = OTBR_ERROR_NONE;
+    }
+    else if (!found)
+    {
+        otbrLogWarning("PfFirewall: the anchor \"%s\" lost its rules behind the agent's back; reinstalling",
+                       kAnchorName);
+        error        = Reinstall();
+        aReinstalled = (error == OTBR_ERROR_NONE);
+    }
+    return error;
+}
+
+otbrError PfFirewall::Reinstall(void)
+{
+    otbrError error = OTBR_ERROR_NONE;
+
+    VerifyOrExit(mInitialized, error = OTBR_ERROR_INVALID_STATE);
+
+    SuccessOrExit(error = FlushAnchor());
+    SuccessOrExit(error = LoadRuleset());
+    if (mIngressFilterEnabled)
+    {
+        SuccessOrExit(error = ReplaceTable(kIngressDenySrcTable, mDenySrc));
+        SuccessOrExit(error = ReplaceTable(kIngressAllowDstTable, mAllowDst));
+    }
 
 exit:
     otbrLogResult(error, "PfFirewall: %s", __FUNCTION__);

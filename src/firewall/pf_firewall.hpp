@@ -114,6 +114,25 @@ public:
      */
     otbrError ReplaceIngressPrefixes(const std::vector<Ip6Prefix> &aDenySrc, const std::vector<Ip6Prefix> &aAllowDst);
 
+    /**
+     * Checks that the anchor still holds what was installed (the filter rules,
+     * the two tables, the NAT rule) and reinstalls everything when it does not.
+     * `pfctl -F all`, a reload of /etc/pf.conf by another tool or a `pfctl -a
+     * otbr -F all` by hand empty the anchor behind the agent's back, and pf has
+     * no event for it, so the agent asks. The nftables backend learns of its
+     * deleted table from the kernel; this is the polling equivalent. A listing
+     * that fails is logged and ignored; only a failed reinstall is an error.
+     *
+     * @param[out] aReinstalled  True when the anchor had to be reinstalled.
+     */
+    otbrError VerifyInstalled(bool &aReinstalled);
+
+    /**
+     * Reinstalls everything that was asked for: the ruleset for the enabled
+     * features and the last contents of the ingress tables.
+     */
+    otbrError Reinstall(void);
+
     bool IsInitialized(void) const { return mInitialized; }
     bool IsIngressFilterEnabled(void) const { return mIngressFilterEnabled; }
     bool IsNat44Enabled(void) const { return mNat44Enabled; }
@@ -137,6 +156,7 @@ private:
     otbrError FlushAnchor(void);
     otbrError LoadRuleset(void);
     otbrError ReplaceTable(const char *aTable, const std::vector<Ip6Prefix> &aPrefixes);
+    otbrError AnchorLists(const char *aListFlag, const std::string &aNeedle, bool &aFound);
 
     IPfctl     &mPfctl;
     std::string mThreadIfName;
@@ -145,6 +165,9 @@ private:
     bool        mInitialized;
     bool        mIngressFilterEnabled;
     bool        mNat44Enabled;
+    // What the tables were last asked to hold, for Reinstall().
+    std::vector<Ip6Prefix> mDenySrc;
+    std::vector<Ip6Prefix> mAllowDst;
 };
 
 } // namespace Firewall
